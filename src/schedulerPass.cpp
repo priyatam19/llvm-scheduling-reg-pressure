@@ -3,7 +3,6 @@
 #include "liveness.hpp"
 #include "traceIdentification.hpp"
 #include "ddg.hpp"
-#include "dom.hpp"
 #include "critical.hpp"
 #include "listScheduler.hpp"
 #include "applySchedule.hpp"
@@ -48,8 +47,11 @@ struct globalSchedulerPass: PassInfoMixin<globalSchedulerPass> {
         // build DDG for each trace
         auto ddgs = buildDDG(traces, livenessResult, reachingResult);
 
-        // Compute dominators using your existing code
-        auto domInfo = computeDominators(F);
+        // Use LLVM's canonical legality analyses.  The pass never changes the
+        // CFG, so they remain structurally valid while instructions move.
+        auto& DT = FAM.getResult<DominatorTreeAnalysis>(F);
+        auto& AC = FAM.getResult<AssumptionAnalysis>(F);
+        auto& TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
         // Compute critical path for each trace DDG
         for (DDG* ddg : ddgs) {
@@ -73,6 +75,12 @@ struct globalSchedulerPass: PassInfoMixin<globalSchedulerPass> {
         // Pass to applySchedule
         auto& LI = FAM.getResult<LoopAnalysis>(F);
 
+        // SCHED_STATS instrumentation: hoist stats (applySchedule) and peak
+        // live pressure (listSchedule) are accumulated across every trace of
+        // this function, so reset once before the loop and emit once after —
+        // no-ops when SCHED_STATS is unset.
+        resetHoistStats();
+        resetPeakLivePressure();
 
         // Run list scheduling for each trace
         // List scheduler produces globally optimal order
@@ -85,14 +93,21 @@ struct globalSchedulerPass: PassInfoMixin<globalSchedulerPass> {
             // Run list scheduler
             // Returns globally ordered instruction list
             auto schedule = listSchedule(ddgs[i], currentLive, universe, livenessResult,  usePressure);
-            
+
             // Apply schedule
             // Phase 1 — reorder within blocks
             // Phase 2 — cross block movement
-            applySchedule(schedule, traces[i], domInfo, LI, universe, livenessResult, usePressure);
+            applySchedule(schedule, traces[i], DT, AC, TLI, LI, universe,
+                          livenessResult, usePressure);
         }
 
-        return PreservedAnalyses::all();
+        emitHoistStats();
+        emitPeakLivePressure();
+
+        for (DDG* ddg : ddgs)
+            delete ddg;
+
+        return PreservedAnalyses::none();
     }
 };
 
@@ -116,10 +131,17 @@ struct localSchedulerPass : PassInfoMixin<localSchedulerPass> {
                 if (!I.getType()->isVoidTy())
                     universe.push_back(&I);
 
+        // SCHED_STATS instrumentation: listSchedule() is called once per
+        // basic block here, so accumulate peak live pressure across all of
+        // them and emit one line for the function. No-op when unset.
+        resetPeakLivePressure();
+
         // Run local scheduler
         runLocalScheduler(F, livenessResult, universe);
 
-        return PreservedAnalyses::all();
+        emitPeakLivePressure();
+
+        return PreservedAnalyses::none();
     }
 };
 

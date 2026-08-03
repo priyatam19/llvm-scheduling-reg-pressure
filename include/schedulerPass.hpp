@@ -12,9 +12,11 @@
 
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
@@ -26,6 +28,6 @@
 #include <llvm/Analysis/BlockFrequencyInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/IR/Verifier.h>
-#include "llvm/Transforms/Utils/SSAUpdater.h"
