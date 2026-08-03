@@ -4,6 +4,7 @@
 #include "critical.hpp"
 #include "listScheduler.hpp"
 #include "liveness.hpp"
+#include "scheduleLegality.hpp"
 
 using namespace llvm;
 
@@ -44,17 +45,18 @@ static DDG* buildLocalDDG(BasicBlock* BB) {
         }
     }   
 
-    // Memory ordering constraints
-    std::vector<Instruction*> memOps;
+    // Conservatively preserve the original order of every operation that may
+    // observe or change memory/program state, including calls.
+    std::vector<Instruction*> orderedOps;
     for (Instruction& I : *BB) {
-        if (isa<LoadInst>(&I) || isa<StoreInst>(&I)) {
-            for (Instruction* prev : memOps) {
+        if (isa<CallBase>(&I) || I.mayReadOrWriteMemory() || I.mayHaveSideEffects()) {
+            for (Instruction* prev : orderedOps) {
                 DDGNode* src = instrToNode.lookup(prev);
                 DDGNode* dst = instrToNode.lookup(&I);
                 if (src && dst)
                     addEdge(src, dst);
             }
-            memOps.push_back(&I);
+            orderedOps.push_back(&I);
         }
     }
 
@@ -69,43 +71,7 @@ static void applyLocalSchedule(
     std::vector<Instruction*>& schedule,
     BasicBlock* BB)
 {
-    std::vector<Instruction*> blockOrder;
-    for (Instruction* I : schedule) {
-        if (I->getParent() == BB &&
-            !I->isTerminator() &&
-            !isa<PHINode>(I))
-            blockOrder.push_back(I);
-    }
-
-    if (blockOrder.empty()) return;
-
-    Instruction* insertPoint = &*BB->getFirstNonPHIIt();
-
-    for (Instruction* I : blockOrder) {
-        if (I->getParent() != BB) continue;
-
-        // Store is an anchor — advance insertPoint past it
-        // so nothing moves before it
-        if (isa<StoreInst>(I)) {
-            // Walk insertPoint forward until it reaches I
-            while (insertPoint != I && insertPoint->getNextNode())
-                insertPoint = insertPoint->getNextNode();
-            // Then step past it
-            if (insertPoint->getNextNode())
-                insertPoint = insertPoint->getNextNode();
-            continue;
-        }
-
-        if (I == insertPoint) {
-            if (insertPoint->getNextNode())
-                insertPoint = insertPoint->getNextNode();
-            continue;
-        }
-
-        I->moveBefore(*BB, insertPoint->getIterator());
-        if (I->getNextNode())
-            insertPoint = I->getNextNode();
-    }
+    reorderBlockWithinRegions(schedule, BB);
 }
 
 // Main local scheduling function
