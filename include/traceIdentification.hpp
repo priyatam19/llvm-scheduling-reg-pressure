@@ -1,15 +1,53 @@
 #pragma once
 
 #include "schedulerPass.hpp"
+#include <cstdlib>
+#include <map>
 
-using namespace llvm; 
+using namespace llvm;
 
 // Trace Identification using profile data
-// Identifies hot execution traces through the CFG using 
+// Identifies hot execution traces through the CFG using
 // branch probabilities (BPI) and block frequencies (BFI).
 
-// Threshold for choosing best Successor and Predecessor - 60%
-static const BranchProbability TRACE_THRESHOLD = BranchProbability(6, 10);
+// Threshold for choosing best Successor and Predecessor - default 60%
+// Overridable via env var SCHED_TRACE_THRESHOLD_PCT (integer percent, e.g. 60)
+// Read once via a function-local static so a sensitivity sweep can vary it
+// without recompiling the pass shared object.
+static BranchProbability getTraceThreshold() {
+    static BranchProbability threshold = [] {
+        int pct = 60;
+        if (const char* env = std::getenv("SCHED_TRACE_THRESHOLD_PCT")) {
+            int parsed = std::atoi(env);
+            if (parsed > 0 && parsed <= 100)
+                pct = parsed;
+        }
+        return BranchProbability(pct, 100);
+    }();
+    return threshold;
+}
+
+// SCHED_STATS=1 opt-in instrumentation toggle, read once.
+static bool schedStatsEnabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("SCHED_STATS");
+        return env && std::string(env) == "1";
+    }();
+    return enabled;
+}
+
+// Per-function counters for trace identification, only touched when
+// schedStatsEnabled() is true.
+struct TraceIdStats {
+    unsigned edgesAboveThreshold = 0;
+    unsigned edgesBelowThreshold = 0;
+    unsigned backedgesSkipped    = 0;
+};
+
+// Global (translation-unit local) stats instance used across the
+// bestSuccessor/bestPredecessor/identifyTraces calls for the function
+// currently being processed. Reset at the start of identifyTraces().
+static TraceIdStats g_traceIdStats;
 
 // Grow trace forward from seed
 // Returns the best successor of BB to extend the trace forward
@@ -29,8 +67,12 @@ static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
         // Get probability of edge BB --> succ
         BranchProbability prob = BPI.getEdgeProbability(BB, succ);
 
-        // Stop if probability is below threshold 60%
-        if (prob <= TRACE_THRESHOLD) continue;
+        // Stop if probability is below threshold (default 60%)
+        if (prob <= getTraceThreshold()) {
+            if (schedStatsEnabled()) g_traceIdStats.edgesBelowThreshold++;
+            continue;
+        }
+        if (schedStatsEnabled()) g_traceIdStats.edgesAboveThreshold++;
 
         // Back edge detection —-- if successor appears before
         // current block in BFS order it is a back edge
@@ -38,7 +80,10 @@ static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
         // Skips back edge
         auto succIt = std::find(bfsOrder.begin(), bfsOrder.end(), succ);
         auto currIt = std::find(bfsOrder.begin(), bfsOrder.end(), BB);
-        if (succIt < currIt) continue;  
+        if (succIt < currIt) {
+            if (schedStatsEnabled()) g_traceIdStats.backedgesSkipped++;
+            continue;
+        }
 
         // Pick the successor with the highest probability
         if (prob > bestProb) {
@@ -70,15 +115,22 @@ static BasicBlock* bestPredecessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
         // Get probability of edge pred --> BB
         BranchProbability prob = BPI.getEdgeProbability(pred, BB);
 
-        // Stop if probability is below threshold 60%
-        if (prob <= TRACE_THRESHOLD) continue;
+        // Stop if probability is below threshold (default 60%)
+        if (prob <= getTraceThreshold()) {
+            if (schedStatsEnabled()) g_traceIdStats.edgesBelowThreshold++;
+            continue;
+        }
+        if (schedStatsEnabled()) g_traceIdStats.edgesAboveThreshold++;
 
         // Back edge detection - if predecessor appears after
         // current block in BFS order it is a back edge
         // Skips back edge
         auto predIt = std::find(bfsOrder.begin(), bfsOrder.end(), pred);
         auto currIt = std::find(bfsOrder.begin(), bfsOrder.end(), BB);
-        if (predIt > currIt) continue;  
+        if (predIt > currIt) {
+            if (schedStatsEnabled()) g_traceIdStats.backedgesSkipped++;
+            continue;
+        }
 
         // Pick predecessor with highest probability
         if (prob > bestProb) {
@@ -101,7 +153,10 @@ std::vector<std::vector<BasicBlock*>> identifyTraces(Function& F,
     
     std::vector<std::vector<BasicBlock*>> traces;
 
-    // Visited set 
+    // Reset per-function stats before extending any traces for this function
+    if (schedStatsEnabled()) g_traceIdStats = TraceIdStats();
+
+    // Visited set
     // Blocks already assigned to a trace
     std::set<BasicBlock*> visited;
 
@@ -163,6 +218,28 @@ std::vector<std::vector<BasicBlock*>> identifyTraces(Function& F,
 
         // Trace complete
         traces.push_back(trace);
+    }
+
+    // Emit end-of-function trace identification stats
+    if (schedStatsEnabled()) {
+        std::map<size_t, unsigned> lenHist;
+        for (auto& trace : traces)
+            lenHist[trace.size()]++;
+
+        errs() << "SCHED_STATS trace_count=" << traces.size() << "\n";
+
+        errs() << "SCHED_STATS trace_len_hist=";
+        bool first = true;
+        for (auto& kv : lenHist) {
+            if (!first) errs() << ",";
+            errs() << kv.first << ":" << kv.second;
+            first = false;
+        }
+        errs() << "\n";
+
+        errs() << "SCHED_STATS edges_above_threshold=" << g_traceIdStats.edgesAboveThreshold
+               << " edges_below_threshold=" << g_traceIdStats.edgesBelowThreshold
+               << " backedges_skipped=" << g_traceIdStats.backedgesSkipped << "\n";
     }
 
     return traces;
