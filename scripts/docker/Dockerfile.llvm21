@@ -1,0 +1,5 @@
+FROM priyatam19/compiler-opts-lli-stats:llvm21
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libxml2 qemu-user qemu-user-static \
+    gcc-riscv64-linux-gnu libc6-dev-riscv64-cross \
+    && rm -rf /var/lib/apt/lists/*
