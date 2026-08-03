@@ -182,20 +182,19 @@ std::vector<DDG*> buildDDG(
             }
         }
 
-        // Memory ordering constraints
-        // Preserves original program order for all memory operations
-        // Covers true (store ---> load), anti (load ---> store), output (store ---> store)
+        // Conservatively preserve original order for every instruction that
+        // may observe or alter memory/program state, including calls.
         for (BasicBlock* BB : trace) {
-            std::vector<Instruction*> memOps;
+            std::vector<Instruction*> orderedOps;
             for (Instruction& I : *BB) {
-                if (isa<LoadInst>(&I) || isa<StoreInst>(&I)) {
-                    for (Instruction* prev : memOps) {
+                if (isa<CallBase>(&I) || I.mayReadOrWriteMemory() || I.mayHaveSideEffects()) {
+                    for (Instruction* prev : orderedOps) {
                         DDGNode* src = instrToNode.lookup(prev);
                         DDGNode* dst = instrToNode.lookup(&I);
                         if (src && dst)
                             addEdge(src, dst);
                     }
-                    memOps.push_back(&I);
+                    orderedOps.push_back(&I);
                 }
             }
         }

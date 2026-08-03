@@ -1,7 +1,9 @@
 #pragma once
 
 #include "schedulerPass.hpp"
-#include "dom.hpp"
+#include "scheduleLegality.hpp"
+#include "traceIdentification.hpp"
+#include <cstdlib>
 
 
 using namespace llvm;
@@ -12,6 +14,34 @@ using namespace llvm;
 // Two phases:
 //   Phase 1 — Within-block reordering
 //   Phase 2 — Cross-block movement
+
+// Register pressure budget used by Phase 2 hoisting decisions.
+// Default 12, overridable via env var SCHED_PRESSURE_BUDGET (integer),
+// read once so a sensitivity sweep can vary it without recompiling.
+static int getPressureBudget() {
+    static int budget = [] {
+        int val = 12;
+        if (const char* env = std::getenv("SCHED_PRESSURE_BUDGET")) {
+            int parsed = std::atoi(env);
+            if (parsed > 0)
+                val = parsed;
+        }
+        return val;
+    }();
+    return budget;
+}
+
+// Per-function Phase 2 hoist stats, only touched when schedStatsEnabled().
+struct HoistStats {
+    unsigned candidates       = 0;
+    unsigned done             = 0;
+    unsigned blockedDominance = 0;
+    unsigned blockedLoop      = 0;
+    unsigned blockedOperand   = 0;
+    unsigned blockedUnsafe    = 0;
+    unsigned blockedPressure  = 0;
+};
+static HoistStats g_hoistStats;
 
 
 // Do not move instruction out of its loop
@@ -27,29 +57,6 @@ static bool isSameLoopOrOuter(BasicBlock* fromBB, BasicBlock* targetBB, LoopInfo
     return true;
 }
 
-// Repairs SSA form after moving instruction I from fromBB to toBB
-// Use SSAUpdater to fix all PHI nodes and uses correctly
-// Uses SSAUpdater to rewrite all non-PHI uses of I's result
-// PHI node users are skipped, SSAUpdater handles them implicitly
-// Used LLVM API here to focus more on our part of global scheduling
-static void fixSSA(Instruction* I, BasicBlock* fromBB, BasicBlock* toBB) {
-
-    if (I->getType()->isVoidTy()) return;
-
-    SSAUpdater SSA;
-    SSA.Initialize(I->getType(), I->getName());
-
-    // Value is now available in toBB
-    SSA.AddAvailableValue(toBB, I);
-
-    // Fix all uses
-    for (Use& U : make_early_inc_range(I->uses())) {
-        Instruction* user = cast<Instruction>(U.getUser());
-        if (isa<PHINode>(user)) continue;
-        SSA.RewriteUse(U);
-    }
-}
-
 // Physically moves instructions to their earliest safe position in the trace
 // Algorithm:
 //   Phase 1 — reorder within each block using global schedule order
@@ -61,7 +68,8 @@ static void fixSSA(Instruction* I, BasicBlock* fromBB, BasicBlock* toBB) {
 //                  all operands available (using current location)
 //                  fix PHI nodes after movement
 static void applySchedule(std::vector<Instruction*>& schedule, std::vector<BasicBlock*>& trace,
-    DomInfo& domInfo, LoopInfo& LI, std::vector<Value*>& universe,   
+    DominatorTree& DT, AssumptionCache& AC, TargetLibraryInfo& TLI,
+    LoopInfo& LI, std::vector<Value*>& universe,
     DenseMap<const BasicBlock*, BlockStateLiveness>& livenessResult, bool usePressure) {
 
     // Map block --- position in trace
@@ -77,53 +85,9 @@ static void applySchedule(std::vector<Instruction*>& schedule, std::vector<Basic
             originalBlock[&I] = BB;
 
 
-    // Phase 1 — reorder within each block
-    // Use schedule order for within-block ordering
-    
-    for (BasicBlock* BB : trace) {
-
-        std::vector<Instruction*> blockOrder;
-        for (Instruction* I : schedule)
-            if (originalBlock.count(I) &&
-                originalBlock[I] == BB &&
-                !I->isTerminator() &&
-                !isa<PHINode>(I))
-                blockOrder.push_back(I);
-
-        if (blockOrder.empty()) continue;
-
-        Instruction* insertPoint = &*BB->getFirstNonPHIIt();
-
-        for (Instruction* I : blockOrder) {
-            if (I->getParent() != BB) continue;
-
-            // Store is an anchor 
-            // advance insertPoint past it
-            // so no instruction moves before it
-            // This is a conservative approach. 
-            // Without alias analysis we cannot prove which
-            // loads are independent of this store, so no instruction
-            // moves before a store it followed in original program order
-
-            if (isa<StoreInst>(I)) {
-                while (insertPoint != I && insertPoint->getNextNode())
-                    insertPoint = insertPoint->getNextNode();
-                if (insertPoint->getNextNode())
-                    insertPoint = insertPoint->getNextNode();
-                continue;
-            }
-
-            if (I == insertPoint) {
-                if (insertPoint->getNextNode())
-                    insertPoint = insertPoint->getNextNode();
-                continue;
-            }
-
-            I->moveBefore(*BB, insertPoint->getIterator());
-            if (I->getNextNode())
-                insertPoint = I->getNextNode();
-        }
-    }   
+    // Phase 1 — reorder pure instructions only within anchor-bounded regions.
+    for (BasicBlock* BB : trace)
+        reorderBlockWithinRegions(schedule, BB);
 
     // Initialize dynamic live sets
     // Updated as instructions are moved
@@ -153,19 +117,45 @@ static void applySchedule(std::vector<Instruction*>& schedule, std::vector<Basic
     //      Def in target block or earlier trace block
     //        If not do a dom check (conservative move)
     // 5. Register pressure budget
+    bool statsOn = schedStatsEnabled();
+
     for (Instruction* I : schedule) {
 
-        // Instructions that are never moved across blocks
-        if (I->isTerminator()) continue;
-        if (isa<PHINode>(I)) continue;
-        if (isa<StoreInst>(I)) continue;
-        if (isa<CallInst>(I)) continue;
-        
         // Get original block
         BasicBlock* origBB = originalBlock.count(I) ? originalBlock[I] : I->getParent();
 
         if (!tracePos.count(origBB)) continue;
         int origIdx = tracePos[origBB];
+
+        // Only instructions with at least one earlier trace block to try
+        // are real hoist candidates for Phase 2 (targetIdx loop below would
+        // otherwise never execute).
+        bool isCandidate = statsOn && origIdx > 0;
+        if (isCandidate) g_hoistStats.candidates++;
+
+        // Rejection-reason ranking used to pick the single most-informative
+        // blocking reason for this candidate across all attempted target
+        // positions (mutually exclusive per candidate — whichever check the
+        // candidate got furthest past before failing). Rank order follows
+        // the order checks run in a single attempt: loop < dominance <
+        // operand-unavailable < pressure.
+        enum class BlockReason { None, Loop, Dominance, Operand, Unsafe, Pressure };
+        BlockReason bestReason = BlockReason::None;
+        auto noteReason = [&](BlockReason r) {
+            if (!statsOn) return;
+            if (static_cast<int>(r) > static_cast<int>(bestReason))
+                bestReason = r;
+        };
+
+        bool moved = false;
+
+        // Anchors are deliberately present in the DDG/list schedule so their
+        // dependencies can release other nodes, but they are never legal
+        // cross-block moves.
+        if (isSchedulingAnchor(I)) {
+            if (isCandidate) g_hoistStats.blockedUnsafe++;
+            continue;
+        }
 
         // Try to move to earliest block in trace
         for (int targetIdx = 0; targetIdx < origIdx; targetIdx++) {
@@ -173,90 +163,70 @@ static void applySchedule(std::vector<Instruction*>& schedule, std::vector<Basic
 
             // Do not move into loop headers
             // they execute every iteration
-            if (LI.isLoopHeader(targetBB)) continue;
+            if (LI.isLoopHeader(targetBB)) { noteReason(BlockReason::Loop); continue; }
 
             // Same loop level only
-            if (!isSameLoopOrOuter(origBB, targetBB, LI)) continue;
+            if (!isSameLoopOrOuter(origBB, targetBB, LI)) { noteReason(BlockReason::Loop); continue; }
 
-            // Check all operands available at targetBB
-            // Use CURRENT location of defs
-            // DDG already guarantees correct schedule order
+            // Moving a single SSA definition upward is legal only when the
+            // destination dominates its original block.  A hot trace order
+            // alone does not establish this property.
+            if (!DT.dominates(targetBB, origBB)) {
+                noteReason(BlockReason::Dominance);
+                continue;
+            }
+
+            Instruction* insertPoint = targetBB->getTerminator();
+            if (!insertPoint) {
+                noteReason(BlockReason::Unsafe);
+                continue;
+            }
+
+            // Check every instruction operand at the exact insertion point.
+            // This correctly handles definitions inside/outside the trace and
+            // definitions moved by an earlier scheduling decision.
             bool ok = true;
             for (Use& U : I->operands()) {
                 Instruction* def = dyn_cast<Instruction>(U.get());
-                // constants and args always ok
-                if (!def) continue; 
-
-                // Current location of def
-                BasicBlock* defBB = def->getParent();
-
-                bool defOk = false;
-                if (defBB == targetBB) {
-                    // Def is in target block
-                    // available
-                    defOk = true;
-                } 
-
-                else if (tracePos.count(defBB) && tracePos[defBB] < targetIdx) {
-                    // Def is in earlier trace block
-                    defOk = true;
-                }
-
-                // Check --— targetBB dominates origBB
-                // Safety --- every path to origBB must pass through targetBB
-                // Consider --- b1->b2->b3->b4 and b1->b5->b4
-                // Moving I from b4 to b3 is wrong if b5→b4 path exists
-                // because b3 is skipped on that path — I never executes
-                // targetBB strictly dominating origBB guarantees no such bypass path exists
-
-                else if (!tracePos.count(defBB)) {
-                    // Def is outside trace
-                    // Check if defBB dominates targetBB
-                    auto defIt = domInfo.idx.find(defBB);
-                    auto tgtIt = domInfo.idx.find(targetBB);
-                    if (defIt != domInfo.idx.end() &&
-                        tgtIt != domInfo.idx.end() &&
-                        domInfo.dom[targetBB].test(defIt->second))
-                        defOk = true;
-                }
-
-                
-                if (!defOk) { ok = false; break; }
+                if (!def) continue;
+                if (!DT.dominates(def, insertPoint)) { ok = false; break; }
             }
 
-            if (!ok) continue;
+            if (!ok) { noteReason(BlockReason::Operand); continue; }
 
-            // Register pressure check 
+            // Even a side-effect-free instruction may be unsafe to execute on
+            // paths that reach targetBB but not origBB (for example, a
+            // potentially trapping operation).  ValueTracking provides the
+            // target-context legality test.  Memory-reading instructions were
+            // already rejected as anchors above.
+            if (!isSafeToSpeculativelyExecute(I, insertPoint, &AC, &DT, &TLI)) {
+                noteReason(BlockReason::Unsafe);
+                continue;
+            }
+
+            // Register pressure check
             // only if usePressure is true
             // Uses dynamic live set that updates with each movement
             // If usePressure is false skip this check entirely
             // and allow movement regardless of pressure impact
 
             // Check the register pressure stays within the budget
-            // Budget of 12 based on observed peak pressure from our benchmark programs
+            // Budget defaults to 12 (overridable via SCHED_PRESSURE_BUDGET),
+            // based on observed peak pressure from our benchmark programs
             if (usePressure) {
                 int pressureAtTarget = (int)dynamicLive[targetBB].count();
                 int delta = pressureDelta(I, dynamicLive[targetBB], universe, livenessResult);
 
                 // RISC V has 32 registers
                 // Allow movement only if total pressure stays within register budget
-                // Budget of 12 (Observed peak pressure of 9 in our benchmark during test runs)
-                // This value is experimental and conservative
-                if (pressureAtTarget + delta > 12) continue;
+                // Default budget of 12 (Observed peak pressure of 9 in our benchmark during test runs)
+                // This value is experimental and conservative; overridable via SCHED_PRESSURE_BUDGET
+                if (pressureAtTarget + delta > getPressureBudget()) { noteReason(BlockReason::Pressure); continue; }
             }
 
             // Safe to move
-            BasicBlock* fromBB = I->getParent();
-
             // Move instruction to targetBB before its terminator
             I->moveBefore(*targetBB, targetBB->getTerminator()->getIterator());
-
-            // Fix SSA
-            // update PHI nodes and uses
-            fixSSA(I, fromBB, targetBB);
-
-            // Update original block map
-            originalBlock[I] = targetBB;
 
             // After moving instruction — update dynamic live set
             // Add I's result to the target block's dynamic live set
@@ -266,7 +236,37 @@ static void applySchedule(std::vector<Instruction*>& schedule, std::vector<Basic
                     dynamicLive[targetBB].set(it - universe.begin());
             }
 
+            moved = true;
+            if (isCandidate) g_hoistStats.done++;
             break;
         }
+
+        if (isCandidate && !moved) {
+            switch (bestReason) {
+                case BlockReason::Loop:      g_hoistStats.blockedLoop++;      break;
+                case BlockReason::Dominance: g_hoistStats.blockedDominance++; break;
+                case BlockReason::Operand:   g_hoistStats.blockedOperand++;   break;
+                case BlockReason::Unsafe:    g_hoistStats.blockedUnsafe++;    break;
+                case BlockReason::Pressure:  g_hoistStats.blockedPressure++;  break;
+                case BlockReason::None:      break; // unreachable: origIdx>0 guarantees >=1 attempt
+            }
+        }
     }
+}
+
+// applySchedule() is called once per trace, so hoist stats must be
+// accumulated by the caller (schedulerPass.cpp) across all traces of a
+// function and reported once per function. Call resetHoistStats() before
+// the per-trace loop and emitHoistStats() after it.
+static void resetHoistStats() { g_hoistStats = HoistStats(); }
+
+static void emitHoistStats() {
+    if (!schedStatsEnabled()) return;
+    errs() << "SCHED_STATS hoist_candidates=" << g_hoistStats.candidates
+           << " hoist_done=" << g_hoistStats.done
+           << " blocked_dominance=" << g_hoistStats.blockedDominance
+           << " blocked_loop=" << g_hoistStats.blockedLoop
+           << " blocked_operand=" << g_hoistStats.blockedOperand
+           << " blocked_unsafe_speculation=" << g_hoistStats.blockedUnsafe
+           << " blocked_pressure=" << g_hoistStats.blockedPressure << "\n";
 }

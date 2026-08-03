@@ -1,8 +1,24 @@
 #pragma once
 
 #include "schedulerPass.hpp"
+#include "traceIdentification.hpp"
 
 using namespace llvm;
+
+// Peak live-set size (bitcount of currentLive) observed while list
+// scheduling. listSchedule() is called once per trace (global scheduler)
+// or once per basic block (local scheduler); the caller in
+// schedulerPass.cpp accumulates the max across all calls for a function
+// and reports one SCHED_STATS line per function via resetPeakLivePressure()
+// / emitPeakLivePressure().
+static unsigned g_peakLivePressure = 0;
+
+static void resetPeakLivePressure() { g_peakLivePressure = 0; }
+
+static void emitPeakLivePressure() {
+    if (!schedStatsEnabled()) return;
+    errs() << "SCHED_STATS peak_live_pressure=" << g_peakLivePressure << "\n";
+}
 
 // Implements the list scheduling algorithm for a single DDG.
 // Produces a linear ordering of instructions that respects
@@ -154,6 +170,12 @@ static std::vector<Instruction*> listSchedule(DDG* ddg, BitVector& currentLive, 
     
     std::vector<Instruction*> schedule;
 
+    bool statsOn = schedStatsEnabled();
+    if (statsOn) {
+        unsigned live0 = currentLive.count();
+        if (live0 > g_peakLivePressure) g_peakLivePressure = live0;
+    }
+
     // Ready queue —-- instructions with no unscheduled predecessors
     // Initially contains all leaves (nodes with no predecessors)
     std::vector<DDGNode*> readyQueue;
@@ -187,6 +209,10 @@ static std::vector<Instruction*> listSchedule(DDG* ddg, BitVector& currentLive, 
         // Update live set after scheduling this instruction
         updateLiveSet(best->instr, currentLive, universe, liveness);
 
+        if (statsOn) {
+            unsigned live = currentLive.count();
+            if (live > g_peakLivePressure) g_peakLivePressure = live;
+        }
 
         // For each successor S of best:
         //     decrement S.predCount
