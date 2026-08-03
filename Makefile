@@ -24,4 +24,7 @@ $(TARGET): $(SRCS)
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: clean
+test: $(TARGET)
+	bash tests/run_ir_tests.sh
+
+.PHONY: clean test
