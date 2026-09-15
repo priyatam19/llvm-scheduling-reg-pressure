@@ -22,7 +22,10 @@ computeLiveness(Function& F) {
     for (auto& I : BB)
         if (!I.getType()->isVoidTy()) universe.push_back(&I);
     unsigned N = universe.size();
-    
+    // O(1) lookups instead of an O(n) std::find(universe, V) per operand
+    // touched below -- see schedulerPass.hpp's buildValueIndex().
+    auto universeIndex = buildValueIndex(universe);
+
     // Collect all the Basic Blocks
     std::vector<BasicBlock*> allBBs;
     for (auto& BB : F) allBBs.push_back(&BB);
@@ -43,16 +46,16 @@ computeLiveness(Function& F) {
     for (Instruction& I : *BB) {
         for (Use& U : I.operands()) {
         Value* V = U.get();
-        auto it = std::find(universe.begin(), universe.end(), V);
-        if (it != universe.end()) {
-            unsigned idx = it - universe.begin();
+        auto it = universeIndex.find(V);
+        if (it != universeIndex.end()) {
+            unsigned idx = it->second;
             if (!bs.def.test(idx))
             bs.use.set(idx);
         }
         }
-        auto it = std::find(universe.begin(), universe.end(), (Value*)&I);
-        if (it != universe.end())
-        bs.def.set(it - universe.begin());
+        auto it = universeIndex.find((Value*)&I);
+        if (it != universeIndex.end())
+        bs.def.set(it->second);
     }
 
     //Save the computed use/def sets for this block
