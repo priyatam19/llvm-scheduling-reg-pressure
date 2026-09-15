@@ -20,6 +20,21 @@ $(TARGET): $(SRCS)
 		$(LDFLAGS) $(LIBS) \
 		-o $(TARGET) $(SRCS)
 
+# Register allocator driver: a small llc-equivalent binary, not a plugin --
+# llc has no runtime-loadable extension point for register allocators (see
+# src/schedRegAllocDriver.cpp for why). Executable, so no -shared -fPIC.
+DRIVER_TARGET := $(BUILD_DIR)/schedRegAllocDriver
+DRIVER_SRCS   := src/schedRegAllocDriver.cpp
+
+$(DRIVER_TARGET): $(DRIVER_SRCS)
+	mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(INCLUDE_DIR) -fuse-ld=lld \
+		$(DRIVER_SRCS) \
+		$(LDFLAGS) $(LIBS) -lzstd -lz \
+		-o $(DRIVER_TARGET)
+
+all: $(TARGET) $(DRIVER_TARGET)
+
 # Clean rule
 clean:
 	rm -rf $(BUILD_DIR)
@@ -27,4 +42,7 @@ clean:
 test: $(TARGET)
 	bash tests/run_ir_tests.sh
 
-.PHONY: clean test
+test-driver-parity: $(TARGET) $(DRIVER_TARGET)
+	bash tests/run_driver_parity.sh
+
+.PHONY: clean test test-driver-parity all
