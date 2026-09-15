@@ -1,0 +1,36 @@
+name: IR legality tests
+
+# Fast, hermetic regression gate: build the pass plugin and run the focused
+# IR-level legality regressions (memory anchors, loop/PHI dominance, hoist
+# speculation safety) via `make test`. No RISC-V toolchain, QEMU, or network
+# downloads needed -- tests/run_ir_tests.sh runs the scheduled IR directly
+# with `lli`, so this stays fast enough to gate every push and PR.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ir-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: priyatam19/compiler-opts-lli-stats:llvm21
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends python3 make
+
+      - name: Build scheduler pass
+        run: make
+
+      - name: Run IR legality regressions
+        run: make test

@@ -1,5 +1,8 @@
 # LLVM Scheduling with Register-Pressure Awareness
 
+[![IR legality tests](https://github.com/priyatam19/llvm-scheduling-reg-pressure/actions/workflows/ir-tests.yml/badge.svg)](https://github.com/priyatam19/llvm-scheduling-reg-pressure/actions/workflows/ir-tests.yml)
+[![Correctness suite](https://github.com/priyatam19/llvm-scheduling-reg-pressure/actions/workflows/correctness-suite.yml/badge.svg)](https://github.com/priyatam19/llvm-scheduling-reg-pressure/actions/workflows/correctness-suite.yml)
+
 This project implements three LLVM IR scheduling configurations and evaluates
 them against an unscheduled `mem2reg` baseline:
 
@@ -126,6 +129,27 @@ scheduling is faster.
 At the 2% threshold, `adpcm` is the only global-over-local win and
 `synthetic_hot` is the only regression. Performance numbers from the earlier
 incorrect schedules should not be used.
+
+## Continuous integration
+
+Two workflows run in `.github/workflows/`:
+
+- **IR legality tests** (`ir-tests.yml`) — every push and PR. Builds the pass
+  and runs `make test` (`tests/run_ir_tests.sh`): the memory-anchor,
+  loop/PHI-dominance, and hoist-speculation regressions under `opt
+  -verify-each`. No RISC-V toolchain or downloads, so it stays fast.
+- **Correctness suite** (`correctness-suite.yml`) — push/PR against `main`,
+  plus manual dispatch. Builds the reference toolchain image, downloads
+  MiBench, and runs Stage A of `scripts/run_suite.py --skip-gem5` (all
+  benchmarks x all configs, compiled and run under QEMU), gated by
+  `scripts/ci_gate.py` so a correctness mismatch fails the build. gem5 (Stage
+  B) measures performance, not correctness, and stays a local/manual step per
+  the instructions above.
+
+`scripts/run_suite.py` itself always exits `0` — it's built for
+interactive/resumable local runs where you inspect and re-run failures rather
+than have the process die. `scripts/ci_gate.py` re-reads its `results.csv` and
+is what actually fails CI on a regression.
 
 ## Diagnostics and tuning
 

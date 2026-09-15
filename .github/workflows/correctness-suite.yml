@@ -1,0 +1,55 @@
+name: Correctness suite (MiBench, no gem5)
+
+# The broader correctness gate described in README.md: build every benchmark
+# through the baseline and all three scheduler configs, run each under QEMU,
+# and require exit code + stdout + output-file hashes to match the baseline
+# exactly (Stage A of scripts/run_suite.py). gem5 (Stage B) is a performance
+# measurement, not a correctness check, so it's intentionally left for local/
+# manual runs per README.md rather than run here.
+#
+# run_suite.py itself always exits 0 (it's built for interactive/resumable
+# use), so scripts/ci_gate.py re-reads its results.csv and fails the build on
+# any correctness regression or config error.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: correctness-suite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build reference toolchain image
+        run: docker build -t sched-bench-llvm21 -f scripts/docker/Dockerfile.llvm21 .
+
+      - name: Download MiBench
+        run: |
+          curl -L https://github.com/embecosm/mibench/archive/refs/heads/master.zip -o /tmp/mibench.zip
+          unzip -q /tmp/mibench.zip -d /tmp
+          cp -r /tmp/mibench-master benchmarks/
+
+      - name: Run Stage A (compile/schedule/QEMU) across all benchmarks
+        run: python3 scripts/run_suite.py --skip-gem5 --out-root build/correctness_ci
+
+      - name: Gate the build on Stage A results
+        run: python3 scripts/ci_gate.py build/correctness_ci/results.csv
+
+      - name: Upload results.csv
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: correctness-results
+          path: build/correctness_ci/results.csv
