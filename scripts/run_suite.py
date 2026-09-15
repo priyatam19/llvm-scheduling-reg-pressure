@@ -71,9 +71,15 @@ def config_matches_original(stage_a, key):
 
 
 def stage_a_correct(stage_a):
+    """Gate on the scheduler configs only (gates_correctness=True). A config
+    like clang_o2 can legitimately diverge from the -O0 baseline (e.g.
+    FMA/vectorization changing FP results) without that being a scheduler
+    regression -- it shouldn't block gem5 for the configs that do need exact
+    equivalence, since they only ever reorder instructions."""
     return bool(stage_a) and all(
         config_matches_original(stage_a, cfg["key"])
-        for cfg in CONFIGS if cfg["key"] != "original"
+        for cfg in CONFIGS
+        if cfg["key"] != "original" and cfg.get("gates_correctness", True)
     )
 
 
