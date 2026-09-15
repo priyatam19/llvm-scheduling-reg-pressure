@@ -134,8 +134,13 @@ def run_one(bench, out_root, extra_env=None):
     profdata = os.path.join(build_dir, "prof.profdata")
     sh(["llvm-profdata", "merge", profraw, "-o", profdata])
 
-    # 2. Recompile each source to riscv64 IR using the collected profile.
+    # 2. Recompile each source to riscv64 IR using the collected profile: once
+    #    at -O0 (shared input for mem2reg + our scheduler plugin, as before),
+    #    and once at -O2 (clang's own full pipeline, for the clang_o2 config --
+    #    same profile data, so the comparison isolates "our scheduler+driver"
+    #    vs. "clang's standard pipeline", not "PGO helped one and not the other").
     ll_files = []
+    ll_files_o2 = []
     for src in sources:
         ll_out = os.path.join(build_dir, os.path.basename(src) + ".ll")
         sh(["clang", "-O0"] + compat_flags
@@ -143,18 +148,27 @@ def run_one(bench, out_root, extra_env=None):
               "-emit-llvm", "-S", src, "-o", ll_out], cwd=workdir)
         ll_files.append(ll_out)
 
+        ll_out_o2 = os.path.join(build_dir, os.path.basename(src) + ".O2.ll")
+        sh(["clang", "-O2"] + compat_flags
+           + [f"-fprofile-instr-use={profdata}", "--target=riscv64-unknown-linux-gnu",
+              "-emit-llvm", "-S", src, "-o", ll_out_o2], cwd=workdir)
+        ll_files_o2.append(ll_out_o2)
+
     linked_ll = os.path.join(build_dir, "linked.ll")
+    linked_ll_o2 = os.path.join(build_dir, "linked.O2.ll")
     if len(ll_files) > 1:
         sh(["llvm-link"] + ll_files + ["-S", "-o", linked_ll])
+        sh(["llvm-link"] + ll_files_o2 + ["-S", "-o", linked_ll_o2])
     else:
         sh(["cp", ll_files[0], linked_ll])
+        sh(["cp", ll_files_o2[0], linked_ll_o2])
 
     results = {}
     for cfg in CONFIGS:
         key = cfg["key"]
         try:
             results[key] = run_config(bench, cfg, build_dir, workdir, libs, linked_ll,
-                                       stdin_path, env)
+                                       linked_ll_o2, stdin_path, env)
         except Exception as e:
             results[key] = {"error": str(e)}
             print(f"!!! config {key} failed: {e}", file=sys.stderr)
@@ -162,7 +176,7 @@ def run_one(bench, out_root, extra_env=None):
     return results
 
 
-def run_config(bench, cfg, build_dir, workdir, libs, linked_ll, stdin_path, env):
+def run_config(bench, cfg, build_dir, workdir, libs, linked_ll, linked_ll_o2, stdin_path, env):
     key = cfg["key"]
     cfg_env = dict(env)
     if cfg["sched_stats"]:
@@ -170,11 +184,18 @@ def run_config(bench, cfg, build_dir, workdir, libs, linked_ll, stdin_path, env)
 
     out_ll = os.path.join(build_dir, f"out_{key}.ll")
     stderr_path = os.path.join(build_dir, f"schedstats_{key}.txt")
-    opt_cmd = ["opt"]
-    if key != "original":
-        opt_cmd.append("-verify-each")
-    opt_cmd += ["-load-pass-plugin", PLUGIN, f"-passes={cfg['passes']}",
-                linked_ll, "-S", "-o", out_ll]
+    if key == "clang_o2":
+        # No scheduler pass involved -- this is clang's own -O2 IR (already
+        # fully optimized), just verified and copied through so the rest of
+        # the pipeline below (llc/driver, llvm-mca, link, qemu) is identical
+        # to every other config from this point on.
+        opt_cmd = ["opt", "-verify-each", linked_ll_o2, "-S", "-o", out_ll]
+    else:
+        opt_cmd = ["opt"]
+        if key != "original":
+            opt_cmd.append("-verify-each")
+        opt_cmd += ["-load-pass-plugin", PLUGIN, f"-passes={cfg['passes']}",
+                    linked_ll, "-S", "-o", out_ll]
     proc = sh(opt_cmd, env=cfg_env)
     with open(stderr_path, "wb") as f:
         f.write(proc.stderr)

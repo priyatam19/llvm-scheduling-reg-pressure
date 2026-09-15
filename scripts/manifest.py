@@ -160,11 +160,21 @@ BENCHMARKS = [
 
 # opt -passes= string per configuration, and whether SCHED_STATS instrumentation applies
 # (only the two global configs go through trace identification / cross-block hoisting).
+#
+# clang_o2 has passes=None and is handled specially by bench_worker.py: instead of
+# mem2reg + our plugin on the shared -O0 profiled IR, it's clang's own full -O2
+# pipeline (inlining/GVN/LICM/its own instruction scheduling/greedy regalloc), fed
+# the *same* profile data as every other config -- the "what would a user actually
+# get off the shelf" comparison point this project previously had no data for.
+# Included in CONFIGS (not a separate list) so it's automatically covered by the
+# existing exit-code/stdout/output-hash correctness gate in run_suite.py, the same
+# way every scheduled config already is.
 CONFIGS = [
     {"key": "original", "passes": "mem2reg", "sched_stats": False},
     {"key": "local", "passes": "mem2reg,localSchedulerPass", "sched_stats": False},
     {"key": "global", "passes": "mem2reg,globalSchedulerPass", "sched_stats": True},
     {"key": "global_no_pressure", "passes": "mem2reg,globalSchedulerPassNoPressure", "sched_stats": True},
+    {"key": "clang_o2", "passes": None, "sched_stats": False},
 ]
 
 # clang flags needed to cross-compile/statically link for riscv64 with this toolchain image
