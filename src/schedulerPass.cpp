@@ -70,6 +70,9 @@ struct globalSchedulerPass: PassInfoMixin<globalSchedulerPass> {
                 universe.push_back(&I);
             }
         }
+        // O(1) Value* -> index lookups for every pressure/liveness site
+        // below, instead of an O(n) std::find(universe, V) per operand.
+        auto universeIndex = buildValueIndex(universe);
 
         // Get loop info
         // Pass to applySchedule
@@ -92,12 +95,12 @@ struct globalSchedulerPass: PassInfoMixin<globalSchedulerPass> {
 
             // Run list scheduler
             // Returns globally ordered instruction list
-            auto schedule = listSchedule(ddgs[i], currentLive, universe, livenessResult,  usePressure);
+            auto schedule = listSchedule(ddgs[i], currentLive, universeIndex, livenessResult,  usePressure);
 
             // Apply schedule
             // Phase 1 — reorder within blocks
             // Phase 2 — cross block movement
-            applySchedule(schedule, traces[i], DT, AC, TLI, LI, universe,
+            applySchedule(schedule, traces[i], DT, AC, TLI, LI, universeIndex,
                           livenessResult, usePressure);
         }
 
@@ -130,6 +133,7 @@ struct localSchedulerPass : PassInfoMixin<localSchedulerPass> {
             for (auto& I : BB)
                 if (!I.getType()->isVoidTy())
                     universe.push_back(&I);
+        auto universeIndex = buildValueIndex(universe);
 
         // SCHED_STATS instrumentation: listSchedule() is called once per
         // basic block here, so accumulate peak live pressure across all of
@@ -137,7 +141,7 @@ struct localSchedulerPass : PassInfoMixin<localSchedulerPass> {
         resetPeakLivePressure();
 
         // Run local scheduler
-        runLocalScheduler(F, livenessResult, universe);
+        runLocalScheduler(F, livenessResult, universeIndex);
 
         emitPeakLivePressure();
 

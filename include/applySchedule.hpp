@@ -69,7 +69,7 @@ static bool isSameLoopOrOuter(BasicBlock* fromBB, BasicBlock* targetBB, LoopInfo
 //                  fix PHI nodes after movement
 static void applySchedule(std::vector<Instruction*>& schedule, std::vector<BasicBlock*>& trace,
     DominatorTree& DT, AssumptionCache& AC, TargetLibraryInfo& TLI,
-    LoopInfo& LI, std::vector<Value*>& universe,
+    LoopInfo& LI, DenseMap<Value*, unsigned>& universeIndex,
     DenseMap<const BasicBlock*, BlockStateLiveness>& livenessResult, bool usePressure) {
 
     // Map block --- position in trace
@@ -215,7 +215,7 @@ static void applySchedule(std::vector<Instruction*>& schedule, std::vector<Basic
             // based on observed peak pressure from our benchmark programs
             if (usePressure) {
                 int pressureAtTarget = (int)dynamicLive[targetBB].count();
-                int delta = pressureDelta(I, dynamicLive[targetBB], universe, livenessResult);
+                int delta = pressureDelta(I, dynamicLive[targetBB], universeIndex, livenessResult);
 
                 // RISC V has 32 registers
                 // Allow movement only if total pressure stays within register budget
@@ -231,9 +231,9 @@ static void applySchedule(std::vector<Instruction*>& schedule, std::vector<Basic
             // After moving instruction — update dynamic live set
             // Add I's result to the target block's dynamic live set
             if (!I->getType()->isVoidTy()) {
-                auto it = std::find(universe.begin(), universe.end(), (Value*)I);
-                if (it != universe.end())
-                    dynamicLive[targetBB].set(it - universe.begin());
+                auto it = universeIndex.find((Value*)I);
+                if (it != universeIndex.end())
+                    dynamicLive[targetBB].set(it->second);
             }
 
             moved = true;

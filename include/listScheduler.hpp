@@ -43,7 +43,7 @@ static void emitPeakLivePressure() {
 // Positive = bad (increases pressure)
 // Uses liveness analysis results to determine which values are live at any point
 // Called during list scheduling as tie breaker when two instructions have equal critical path
-static int pressureDelta(Instruction* I, BitVector& currentLive, std::vector<Value*>& universe, 
+static int pressureDelta(Instruction* I, BitVector& currentLive, DenseMap<Value*, unsigned>& universeIndex,
     DenseMap<const BasicBlock*, BlockStateLiveness>& liveness) {
 
     int delta = 0;
@@ -51,9 +51,9 @@ static int pressureDelta(Instruction* I, BitVector& currentLive, std::vector<Val
     // Inst I produces a new value which pressure increases
     // only if the value was not already live
     if (!I->getType()->isVoidTy()) {
-        auto it = std::find(universe.begin(), universe.end(), (Value*)I);
-        if (it != universe.end()) {
-            unsigned idx = it - universe.begin();
+        auto it = universeIndex.find((Value*)I);
+        if (it != universeIndex.end()) {
+            unsigned idx = it->second;
             // New value entering live set
             if (!currentLive.test(idx))
                 delta++;
@@ -66,9 +66,9 @@ static int pressureDelta(Instruction* I, BitVector& currentLive, std::vector<Val
     BasicBlock* BB = I->getParent();
     for (Use& U : I->operands()) {
         Value* V = U.get();
-        auto it = std::find(universe.begin(), universe.end(), V);
-        if (it == universe.end()) continue;
-        unsigned idx = it - universe.begin();
+        auto it = universeIndex.find(V);
+        if (it == universeIndex.end()) continue;
+        unsigned idx = it->second;
 
         // If V is in current live set but not live out of block
         // it dies at or before end of block
@@ -85,23 +85,23 @@ static int pressureDelta(Instruction* I, BitVector& currentLive, std::vector<Val
 // Adds I's result to live set if it produces a value
 // Removes operands that die at I
 static void updateLiveSet(Instruction* I, BitVector& currentLive,
-    std::vector<Value*>& universe, DenseMap<const BasicBlock*, 
+    DenseMap<Value*, unsigned>& universeIndex, DenseMap<const BasicBlock*,
     BlockStateLiveness>& liveness){
 
     // Add I's result to live set
     if (!I->getType()->isVoidTy()) {
-        auto it = std::find(universe.begin(), universe.end(), (Value*)I);
-        if (it != universe.end())
-            currentLive.set(it - universe.begin());
+        auto it = universeIndex.find((Value*)I);
+        if (it != universeIndex.end())
+            currentLive.set(it->second);
     }
 
     // Remove operands that die here
     BasicBlock* BB = I->getParent();
     for (Use& U : I->operands()) {
         Value* V = U.get();
-        auto it = std::find(universe.begin(), universe.end(), V);
-        if (it == universe.end()) continue;
-        unsigned idx = it - universe.begin();
+        auto it = universeIndex.find(V);
+        if (it == universeIndex.end()) continue;
+        unsigned idx = it->second;
 
         // If not live out of block --- remove from live set
         if (!liveness[BB].out.test(idx))
@@ -114,7 +114,7 @@ static void updateLiveSet(Instruction* I, BitVector& currentLive,
 // Priority 1 — highest critical path
 // Priority 2 — lowest pressure delta (tie breaker)
 static DDGNode* pickBest(std::vector<DDGNode*>& readyQueue, BitVector& currentLive,
-    std::vector<Value*>& universe, DenseMap<const BasicBlock*, 
+    DenseMap<Value*, unsigned>& universeIndex, DenseMap<const BasicBlock*,
     BlockStateLiveness>& liveness, bool useRegPressure = true){
 
     DDGNode* best = nullptr;
@@ -129,7 +129,7 @@ static DDGNode* pickBest(std::vector<DDGNode*>& readyQueue, BitVector& currentLi
         // Since we do global scheduling with and without register pressure analysis
         // This flag is used to run globalScheduler with and without reg pressure analysis
         // If False then always 0
-        int delta = useRegPressure ? pressureDelta(node->instr, currentLive, universe, liveness): 0;
+        int delta = useRegPressure ? pressureDelta(node->instr, currentLive, universeIndex, liveness): 0;
 
         // Priority 1
         if (cp > bestCP) {
@@ -165,7 +165,7 @@ static DDGNode* pickBest(std::vector<DDGNode*>& readyQueue, BitVector& currentLi
 // This order is used by applySchedule() to
 // physically reorder instructions in IR
 // -------------------------------------------------------
-static std::vector<Instruction*> listSchedule(DDG* ddg, BitVector& currentLive, std::vector<Value*>& universe,
+static std::vector<Instruction*> listSchedule(DDG* ddg, BitVector& currentLive, DenseMap<Value*, unsigned>& universeIndex,
     DenseMap<const BasicBlock*, BlockStateLiveness>& liveness, bool useRegPressure = true){
     
     std::vector<Instruction*> schedule;
@@ -198,16 +198,19 @@ static std::vector<Instruction*> listSchedule(DDG* ddg, BitVector& currentLive, 
         // Pick best instruction from ready queue
         // Priority 1 — highest critical path
         // Priority 2 — lowest pressure delta (tie breaker)
-        DDGNode* best = pickBest(readyQueue, currentLive, universe, liveness, useRegPressure);
+        DDGNode* best = pickBest(readyQueue, currentLive, universeIndex, liveness, useRegPressure);
 
-        // Remove from ready queue
+        // Remove from ready queue. readyQueue is bounded by instruction-level
+        // parallelism (how many nodes are simultaneously ready), not function
+        // size, so this std::find isn't the quadratic-over-the-function
+        // pattern the universe lookups above were -- left as is.
         readyQueue.erase(std::find(readyQueue.begin(), readyQueue.end(), best));
 
         // Add to schedule
         schedule.push_back(best->instr);
 
         // Update live set after scheduling this instruction
-        updateLiveSet(best->instr, currentLive, universe, liveness);
+        updateLiveSet(best->instr, currentLive, universeIndex, liveness);
 
         if (statsOn) {
             unsigned live = currentLive.count();

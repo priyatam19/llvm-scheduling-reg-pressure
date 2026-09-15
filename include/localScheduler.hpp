@@ -82,8 +82,8 @@ static void applyLocalSchedule(
 //   2. Compute critical path within block
 //   3. List schedule with cp + pressure tie breaker
 //   4. Apply scheduling within block only
-static void runLocalScheduler(Function& F, DenseMap<const BasicBlock*, 
-    BlockStateLiveness>& livenessResult, std::vector<Value*>& universe){
+static void runLocalScheduler(Function& F, DenseMap<const BasicBlock*,
+    BlockStateLiveness>& livenessResult, DenseMap<Value*, unsigned>& universeIndex){
     // Schedule each block independently
     // Iterates each basic block
     for (auto& BB : F) {
@@ -99,7 +99,7 @@ static void runLocalScheduler(Function& F, DenseMap<const BasicBlock*,
 
         // List schedule uses same algorithm as global
         // critical path priority + pressure tie breaker
-        auto schedule = listSchedule(ddg, currentLive, universe, livenessResult);
+        auto schedule = listSchedule(ddg, currentLive, universeIndex, livenessResult);
 
         // Apply scheduling to the block only
         // No cross block movement

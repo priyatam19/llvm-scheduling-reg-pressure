@@ -49,16 +49,27 @@ struct TraceIdStats {
 // currently being processed. Reset at the start of identifyTraces().
 static TraceIdStats g_traceIdStats;
 
+// BFS order position of BB, or bfsIndex.size() ("after everything") if BB
+// was never reached by the forward BFS from the entry block -- e.g. an
+// otherwise-unreachable block that still has an edge into a reachable one.
+// Mirrors std::find(bfsOrder, BB) == bfsOrder.end() exactly, so swapping the
+// old O(n) std::find-based back-edge check for this DenseMap lookup can't
+// change which edges are classified as back edges.
+static unsigned bfsPos(DenseMap<BasicBlock*, unsigned>& bfsIndex, BasicBlock* BB) {
+    auto it = bfsIndex.find(BB);
+    return it != bfsIndex.end() ? it->second : (unsigned)bfsIndex.size();
+}
+
 // Grow trace forward from seed
 // Returns the best successor of BB to extend the trace forward
 // Valid successor must --- not be visited, exceed threshold probability,
 // and not be a loop back edge
-static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI, 
-        std::set<BasicBlock*>& visited, std::vector<BasicBlock*>& bfsOrder) {
+static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
+        std::set<BasicBlock*>& visited, DenseMap<BasicBlock*, unsigned>& bfsIndex) {
 
     BasicBlock* best    = nullptr;
     BranchProbability bestProb = BranchProbability::getZero();
-    
+
     for (BasicBlock* succ : successors(BB)) {
 
         // Skip if already in a trace
@@ -78,9 +89,7 @@ static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
         // current block in BFS order it is a back edge
         // Back edges close loops so stops trace here
         // Skips back edge
-        auto succIt = std::find(bfsOrder.begin(), bfsOrder.end(), succ);
-        auto currIt = std::find(bfsOrder.begin(), bfsOrder.end(), BB);
-        if (succIt < currIt) {
+        if (bfsPos(bfsIndex, succ) < bfsPos(bfsIndex, BB)) {
             if (schedStatsEnabled()) g_traceIdStats.backedgesSkipped++;
             continue;
         }
@@ -93,7 +102,7 @@ static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
     }
 
     // null if no valid successor found
-    return best;  
+    return best;
 }
 
 
@@ -102,7 +111,7 @@ static BasicBlock* bestSuccessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
 // Valid predecessor must --- not be visited, exceed threshold probability,
 // and not be a loop back edge
 static BasicBlock* bestPredecessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
-        std::set<BasicBlock*>& visited, std::vector<BasicBlock*>& bfsOrder) {
+        std::set<BasicBlock*>& visited, DenseMap<BasicBlock*, unsigned>& bfsIndex) {
 
     BasicBlock* best    = nullptr;
     BranchProbability bestProb = BranchProbability::getZero();
@@ -125,9 +134,7 @@ static BasicBlock* bestPredecessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
         // Back edge detection - if predecessor appears after
         // current block in BFS order it is a back edge
         // Skips back edge
-        auto predIt = std::find(bfsOrder.begin(), bfsOrder.end(), pred);
-        auto currIt = std::find(bfsOrder.begin(), bfsOrder.end(), BB);
-        if (predIt > currIt) {
+        if (bfsPos(bfsIndex, pred) > bfsPos(bfsIndex, BB)) {
             if (schedStatsEnabled()) g_traceIdStats.backedgesSkipped++;
             continue;
         }
@@ -140,7 +147,7 @@ static BasicBlock* bestPredecessor(BasicBlock* BB, BranchProbabilityInfo& BPI,
     }
 
     // null if no valid predecessor found
-    return best;  
+    return best;
 }
 
 // Identifies all hot execution traces through function F
@@ -161,31 +168,53 @@ std::vector<std::vector<BasicBlock*>> identifyTraces(Function& F,
     std::set<BasicBlock*> visited;
 
     // BFS order used for back edge detection
-    // A successor that appears before current block in BFS order is a back edge 
+    // A successor that appears before current block in BFS order is a back edge
+    // bfsIndex mirrors bfsOrder's positions in O(1)-lookup form: bestSuccessor/
+    // bestPredecessor used to std::find() into bfsOrder per edge examined,
+    // which is O(n) per edge (O(n^2) or worse per function); membership below
+    // (`bfsIndex.count(succ)`) replaces the same std::find pattern used during
+    // BFS construction itself.
     std::vector<BasicBlock*> bfsOrder;
+    DenseMap<BasicBlock*, unsigned> bfsIndex;
     bfsOrder.push_back(&F.getEntryBlock());
+    bfsIndex[&F.getEntryBlock()] = 0;
     for (size_t i = 0; i < bfsOrder.size(); ++i)
         for (BasicBlock* succ : successors(bfsOrder[i]))
-            if (std::find(bfsOrder.begin(), bfsOrder.end(), succ) == bfsOrder.end())
+            if (!bfsIndex.count(succ)) {
+                bfsIndex[succ] = bfsOrder.size();
                 bfsOrder.push_back(succ);
+            }
 
-    // Seed — unvisited block with highest execution frequency
+    // Seed selection picks the unvisited block with the highest execution
+    // frequency, once per trace formed. The original rescanned all of
+    // bfsOrder from scratch for every trace (O(n) per trace, so O(n^2) over
+    // a function with many small traces). Block frequencies don't change as
+    // traces are grown, so sorting once up front and walking a
+    // monotonically-advancing cursor past already-visited entries visits
+    // each block at most once in total across every trace, while picking
+    // the exact same block every time: stable_sort keeps entries tied on
+    // frequency in their original bfsOrder order, which is exactly the
+    // "first encountered in bfsOrder wins ties" behavior the original
+    // strict `freq > bestFreq` scan had.
+    std::vector<BasicBlock*> byFreqDesc = bfsOrder;
+    std::stable_sort(byFreqDesc.begin(), byFreqDesc.end(), [&](BasicBlock* a, BasicBlock* b) {
+        return BFI.getBlockFreq(a).getFrequency() > BFI.getBlockFreq(b).getFrequency();
+    });
+    size_t seedCursor = 0;
+
     // Pick seeds until all blocks are assigned to a trace
     while (true) {
 
-        BasicBlock* seed = nullptr;
-        uint64_t bestFreq = 0;
+        while (seedCursor < byFreqDesc.size() && visited.count(byFreqDesc[seedCursor]))
+            ++seedCursor;
+        BasicBlock* seed = seedCursor < byFreqDesc.size() ? byFreqDesc[seedCursor] : nullptr;
 
-        for (BasicBlock* BB : bfsOrder) {
-            if (visited.count(BB)) continue;
-            uint64_t freq = BFI.getBlockFreq(BB).getFrequency();
-            if (freq > bestFreq) {
-                bestFreq = freq;
-                seed = BB;
-            }
-        }
+        // A zero-frequency block is never picked as a seed, matching the
+        // original's `freq > bestFreq` with bestFreq starting at 0.
+        if (seed && BFI.getBlockFreq(seed).getFrequency() == 0)
+            seed = nullptr;
 
-        // If no more unvisited blocks
+        // If no more unvisited (nonzero-frequency) blocks
         if (!seed) break;
 
         // Start a new trace with the seed found
@@ -198,7 +227,7 @@ std::vector<std::vector<BasicBlock*>> identifyTraces(Function& F,
         // Stops at --- back edges, low probability edges, visited blocks
         BasicBlock* current = seed;
         while (true) {
-            BasicBlock* next = bestSuccessor(current, BPI, visited, bfsOrder);
+            BasicBlock* next = bestSuccessor(current, BPI, visited, bfsIndex);
             if (!next) break;
             trace.push_back(next);
             visited.insert(next);
@@ -209,7 +238,7 @@ std::vector<std::vector<BasicBlock*>> identifyTraces(Function& F,
         // Follow best predecessor until no valid predecessor found
         current = seed;
         while (true) {
-            BasicBlock* prev = bestPredecessor(current, BPI, visited, bfsOrder);
+            BasicBlock* prev = bestPredecessor(current, BPI, visited, bfsIndex);
             if (!prev) break;
             trace.insert(trace.begin(), prev);
             visited.insert(prev);

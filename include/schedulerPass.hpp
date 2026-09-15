@@ -31,3 +31,21 @@
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/IR/Verifier.h>
+
+// universe (args + non-void instructions, built once per function in
+// schedulerPass.cpp) fixes the bit ordering shared by every BitVector this
+// pass touches -- computeLiveness's own internal universe uses the same
+// enumeration, so index i here must mean the same value as bit i there.
+// This map is purely a lookup accelerator over that fixed ordering: every
+// pressure/liveness site used to do a linear std::find(universe, V) per
+// operand, which made scheduling cost O(instructions-in-function) per
+// operand touched -- quadratic-ish over a whole function. Building this
+// once and looking values up in O(1) doesn't change which index any value
+// gets, so it can't change any scheduling decision.
+static llvm::DenseMap<llvm::Value*, unsigned> buildValueIndex(std::vector<llvm::Value*>& universe) {
+    llvm::DenseMap<llvm::Value*, unsigned> index;
+    index.reserve(universe.size());
+    for (unsigned i = 0; i < universe.size(); ++i)
+        index[universe[i]] = i;
+    return index;
+}
