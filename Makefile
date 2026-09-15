@@ -33,6 +33,10 @@ $(DRIVER_TARGET): $(DRIVER_SRCS)
 		$(LDFLAGS) $(LIBS) -lzstd -lz \
 		-o $(DRIVER_TARGET)
 
+# NOTE: $(TARGET) above stays make's default goal (bare `make`, as used by
+# ir-tests.yml and this repo's own docs, must keep building only the plugin).
+# `all` is opt-in -- run it (or test-driver-parity, which depends on both
+# targets directly) explicitly to also build the driver.
 all: $(TARGET) $(DRIVER_TARGET)
 
 # Clean rule

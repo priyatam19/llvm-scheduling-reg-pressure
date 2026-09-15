@@ -80,6 +80,10 @@ int main(int argc, char **argv) {
   Triple TheTriple(M->getTargetTriple());
   if (TheTriple.getTriple().empty())
     TheTriple = Triple("riscv64-unknown-linux-gnu");
+  // Write the resolved triple back onto the module, matching llc: downstream
+  // codegen and TargetLibraryInfo can query M->getTargetTriple() directly,
+  // and it should never observe the pre-fallback empty triple.
+  M->setTargetTriple(TheTriple);
 
   std::string Error;
   const Target *TheTarget =
